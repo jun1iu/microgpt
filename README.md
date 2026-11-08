@@ -5,7 +5,7 @@ production LLM systems: rotary position embeddings, RMSNorm, SwiGLU, an incremen
 **KV cache**, nucleus sampling, and a test suite that proves each piece is correct.
 
 No `nn.Transformer`, no Hugging Face. Attention, masking, caching and sampling are all
-written out explicitly (~250 lines of model code) so every line can be reasoned about.
+written out explicitly (~220 lines of model code) so every line can be reasoned about.
 
 ## What's inside
 
