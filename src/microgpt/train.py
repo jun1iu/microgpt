@@ -43,6 +43,7 @@ def main() -> None:
     p.add_argument("--n-layer", type=int, default=4)
     p.add_argument("--n-head", type=int, default=4)
     p.add_argument("--n-embd", type=int, default=128)
+    p.add_argument("--n-kv-head", type=int, default=None, help="KV heads (GQA); default = n-head")
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--warmup", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=100)
@@ -62,6 +63,7 @@ def main() -> None:
         n_layer=args.n_layer,
         n_head=args.n_head,
         n_embd=args.n_embd,
+        n_kv_head=args.n_kv_head,
     )
     model = GPT(cfg)
     print(f"vocab={tok.vocab_size} params={model.num_params():,} train_chars={len(train_data):,}")

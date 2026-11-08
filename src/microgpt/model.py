@@ -3,7 +3,8 @@
 Architecture (the Llama recipe, at toy scale):
   * RMSNorm pre-normalisation
   * Rotary position embeddings (RoPE) applied to queries and keys
-  * Causal multi-head self-attention, written out explicitly (no nn.Transformer)
+  * Causal self-attention, written out explicitly (no nn.Transformer), with optional
+    grouped-query attention (GQA/MQA) to shrink the KV cache
   * SwiGLU feed-forward network
   * Tied input/output embeddings
   * Per-layer key/value cache for incremental decoding
@@ -32,6 +33,16 @@ class GPTConfig:
     n_head: int = 4
     n_embd: int = 128
     rope_base: float = 10000.0
+    n_kv_head: Optional[int] = None  # None -> multi-head; 1 -> multi-query; else grouped-query
+
+    @property
+    def kv_heads(self) -> int:
+        return self.n_head if self.n_kv_head is None else self.n_kv_head
+
+
+def kv_cache_bytes(cache: KVCache) -> int:
+    """Total bytes held by a key/value cache."""
+    return sum(t.numel() * t.element_size() for kv in cache for t in kv)
 
 
 class RMSNorm(nn.Module):
@@ -67,40 +78,71 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig) -> None:
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0, "n_embd must be divisible by n_head"
+        if cfg.n_head % cfg.kv_heads != 0:
+            raise ValueError(f"n_head {cfg.n_head} not divisible by kv heads {cfg.kv_heads}")
         self.n_head = cfg.n_head
+        self.n_kv = cfg.kv_heads
         self.head_dim = cfg.n_embd // cfg.n_head
         assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
-        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
+        # One projection produces n_head query heads but only n_kv key/value heads.
+        self.qkv = nn.Linear(cfg.n_embd, (cfg.n_head + 2 * self.n_kv) * self.head_dim, bias=False)
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         cos, sin = rope_tables(self.head_dim, cfg.block_size, cfg.rope_base)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
     def forward(
-        self, x: torch.Tensor, cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self,
+        x: torch.Tensor,
+        cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        positions: Optional[torch.Tensor] = None,
+        key_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """x: (B, T, C). Optional batching arguments, used for variable-length batches:
+
+        positions: (B, T) true position of each new token (so left-padding does not shift RoPE).
+        key_mask:  (B, past + T) bool, False for padding columns that must never be attended to.
+        """
         B, T, C = x.shape
+        hd = self.head_dim
         past = 0 if cache is None else cache[0].size(2)
 
-        q, k, v = self.qkv(x).split(C, dim=2)
-        q, k, v = (t.view(B, T, self.n_head, self.head_dim).transpose(1, 2) for t in (q, k, v))
+        q, k, v = self.qkv(x).split([self.n_head * hd, self.n_kv * hd, self.n_kv * hd], dim=2)
+        q = q.view(B, T, self.n_head, hd).transpose(1, 2)  # (B, n_head, T, hd)
+        k = k.view(B, T, self.n_kv, hd).transpose(1, 2)  # (B, n_kv,   T, hd)
+        v = v.view(B, T, self.n_kv, hd).transpose(1, 2)
 
         # Positions are absolute, so cached keys keep the rotation they were stored with.
-        cos, sin = self.cos[past : past + T], self.sin[past : past + T]
+        if positions is None:
+            cos, sin = self.cos[past : past + T], self.sin[past : past + T]
+        else:
+            cos, sin = self.cos[positions].unsqueeze(1), self.sin[positions].unsqueeze(1)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
         if cache is not None:
             k = torch.cat((cache[0], k), dim=2)
             v = torch.cat((cache[1], v), dim=2)
-        new_cache = (k, v)
+        new_cache = (k, v)  # cached at n_kv heads: this is where GQA saves memory
 
+        # Each group of g query heads shares one key/value head. Instead of copying K/V g times
+        # we view q as (B, n_kv, g, T, hd) and let matmul broadcast over the group axis.
         S = k.size(2)  # total keys = past + T
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # Query i sits at absolute position past + i and may see keys j <= past + i.
+        g = self.n_head // self.n_kv
+        q = q.reshape(B, self.n_kv, g, T, hd)
+        scores = (q @ k.unsqueeze(2).transpose(-2, -1)) / math.sqrt(hd)  # (B, n_kv, g, T, S)
+
+        # Query i sits at absolute column past + i and may see columns j <= past + i.
         allowed = torch.ones(T, S, dtype=torch.bool, device=x.device).tril(diagonal=S - T)
+        if key_mask is not None:
+            # A padded query would otherwise have no visible key (softmax over all -inf = NaN,
+            # which would then poison real tokens through v). Let every query see itself.
+            own = torch.arange(T, device=x.device)[:, None] + (S - T) == torch.arange(
+                S, device=x.device
+            )
+            allowed = ((allowed[None] & key_mask[:, None, :]) | own[None])[:, None, None]
         scores = scores.masked_fill(~allowed, float("-inf"))
-        out = F.softmax(scores, dim=-1) @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        out = F.softmax(scores, dim=-1) @ v.unsqueeze(2)  # (B, n_kv, g, T, hd)
+        out = out.reshape(B, self.n_head, T, hd).transpose(1, 2).reshape(B, T, C)
         return self.proj(out), new_cache
 
 
@@ -125,8 +167,8 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(cfg.n_embd)
         self.mlp = SwiGLU(cfg)
 
-    def forward(self, x, cache=None):
-        a, new_cache = self.attn(self.norm1(x), cache)
+    def forward(self, x, cache=None, positions=None, key_mask=None):
+        a, new_cache = self.attn(self.norm1(x), cache, positions, key_mask)
         x = x + a
         x = x + self.mlp(self.norm2(x))
         return x, new_cache
@@ -160,17 +202,27 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
         cache: Optional[KVCache] = None,
+        positions: Optional[torch.Tensor] = None,
+        key_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], KVCache]:
-        """Return (logits, loss, new_cache). Pass `cache` to decode incrementally."""
+        """Return (logits, loss, new_cache). Pass `cache` to decode incrementally.
+
+        `positions` / `key_mask` enable variable-length batches (see microgpt.batching).
+        """
         _, T = idx.shape
         past = 0 if cache is None else cache[0][0].size(2)
-        if past + T > self.cfg.block_size:
-            raise ValueError(f"sequence length {past + T} exceeds block_size {self.cfg.block_size}")
+        if positions is None:
+            if past + T > self.cfg.block_size:
+                raise ValueError(
+                    f"sequence length {past + T} exceeds block_size {self.cfg.block_size}"
+                )
+        elif int(positions.max()) >= self.cfg.block_size:
+            raise ValueError(f"position exceeds block_size {self.cfg.block_size}")
 
         x = self.tok_emb(idx)
         new_cache: KVCache = []
         for i, block in enumerate(self.blocks):
-            x, layer_cache = block(x, None if cache is None else cache[i])
+            x, layer_cache = block(x, None if cache is None else cache[i], positions, key_mask)
             new_cache.append(layer_cache)
         logits = self.lm_head(self.norm_f(x))
 
