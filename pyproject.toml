@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microgpt"
+version = "0.1.0"
+description = "A from-scratch GPT in PyTorch: RoPE, RMSNorm, SwiGLU, KV-cache inference, and the tests that prove it is correct."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.2", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+microgpt-train = "microgpt.train:main"
+microgpt-generate = "microgpt.generate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "UP045"]
