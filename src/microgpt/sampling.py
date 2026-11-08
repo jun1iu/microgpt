@@ -25,6 +25,29 @@ def filter_top_p(logits: torch.Tensor, p: float) -> torch.Tensor:
     return torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
 
 
+def logits_to_probs(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+) -> torch.Tensor:
+    """The exact distribution a sampler draws from: temperature, then top-k, then top-p.
+
+    temperature == 0 gives a one-hot at the argmax, so greedy decoding is just the
+    degenerate case of sampling (speculative decoding relies on this uniform view).
+    """
+    if temperature < 0:
+        raise ValueError("temperature must be >= 0")
+    if temperature == 0:
+        return F.one_hot(logits.argmax(dim=-1), logits.size(-1)).to(logits.dtype)
+    logits = logits / temperature
+    if top_k is not None:
+        logits = filter_top_k(logits, top_k)
+    if top_p is not None:
+        logits = filter_top_p(logits, top_p)
+    return F.softmax(logits, dim=-1)
+
+
 def sample_next(
     logits: torch.Tensor,
     temperature: float = 1.0,
@@ -40,10 +63,5 @@ def sample_next(
         raise ValueError("temperature must be >= 0")
     if temperature == 0:
         return logits.argmax(dim=-1, keepdim=True)
-    logits = logits / temperature
-    if top_k is not None:
-        logits = filter_top_k(logits, top_k)
-    if top_p is not None:
-        logits = filter_top_p(logits, top_p)
-    probs = F.softmax(logits, dim=-1)
+    probs = logits_to_probs(logits, temperature, top_k, top_p)
     return torch.multinomial(probs, num_samples=1, generator=generator)

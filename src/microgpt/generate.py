@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 import torch
 
 from microgpt.data import CharTokenizer
 from microgpt.model import GPT, GPTConfig
+from microgpt.speculative import speculative_generate
 
 
 def load_checkpoint(path: str):
@@ -28,11 +30,26 @@ def main() -> None:
     p.add_argument("--top-p", type=float, default=None)
     p.add_argument("--no-cache", action="store_true", help="disable the KV cache")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--draft", default=None, help="draft checkpoint: enables speculative decoding")
+    p.add_argument("--gamma", type=int, default=4, help="tokens proposed per speculative round")
     args = p.parse_args()
 
     model, tok = load_checkpoint(args.ckpt)
     g = torch.Generator().manual_seed(args.seed)
     idx = torch.tensor([tok.encode(args.prompt)], dtype=torch.long)
+    if args.draft:
+        draft, _ = load_checkpoint(args.draft)
+        out, stats = speculative_generate(
+            model, draft, idx, args.tokens, gamma=args.gamma, temperature=args.temperature,
+            top_k=args.top_k, top_p=args.top_p, generator=g,
+        )  # fmt: skip
+        print(tok.decode(out[0].tolist()))
+        print(
+            f"\n[speculative: {stats.acceptance_rate:.0%} accepted, "
+            f"{stats.tokens_per_target_call:.2f} tokens per target pass]",
+            file=sys.stderr,
+        )
+        return
     out = model.generate(
         idx,
         args.tokens,
