@@ -2,11 +2,13 @@
 
 A GPT-style language model written from scratch in PyTorch, plus the inference techniques that
 matter in production LLM serving: a **KV cache**, **grouped-query attention**, **continuous
-batching** over variable-length requests, and **speculative decoding**. Every one of them is
-backed by tests that check correctness against a reference, not just "it runs".
+batching** over variable-length requests, **speculative decoding**, and a **byte-level BPE
+tokenizer**. Every one of them is backed by tests that check correctness against a reference,
+not just "it runs".
 
-No `nn.Transformer`, no Hugging Face. Attention, masking, caching, batching and sampling are all
-written out explicitly (~900 lines of library code) so every line can be reasoned about.
+No `nn.Transformer`, no Hugging Face, no tokenizer library. Attention, masking, caching,
+batching, sampling and tokenization are all written out explicitly (~1,100 lines of library code)
+so every line can be reasoned about.
 
 ## What's inside
 
@@ -17,6 +19,7 @@ written out explicitly (~900 lines of library code) so every line can be reasone
 | KV cache + sliding window | `model.py` | `O(T)` work per generated token instead of `O(T^2)` |
 | Continuous batching | `batching.py` | Left-padded shared cache, per-row RoPE positions, key mask, mid-flight admission, column trimming |
 | Speculative decoding | `speculative.py` | Exact target distribution (rejection sampling + residual), cache rollback |
+| Byte-level BPE tokenizer | `bpe.py` | Lossless on any string (256-byte base), incremental pair-count updates, deterministic ties, special tokens |
 | Sampling: temperature / top-k / top-p | `sampling.py` | `logits_to_probs` exposes the exact sampling distribution (greedy = one-hot) |
 | Trainer | `train.py` | AdamW with decoupled decay, warmup + cosine LR, grad clipping |
 
@@ -25,11 +28,13 @@ written out explicitly (~900 lines of library code) so every line can be reasone
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 49 tests, ~15s on CPU
+pytest                                   # 69 tests, ~15s on CPU
 
 mkdir -p data && curl -sSL -o data/shakespeare.txt \
   https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 python -m microgpt.train --data data/shakespeare.txt --steps 1200 --batch-size 24
+python -m microgpt.train --data data/shakespeare.txt --tokenizer bpe --vocab-size 512 \
+    --steps 1200 --batch-size 24 --out checkpoints/bpe.pt   # BPE instead of characters
 python -m microgpt.train --data data/shakespeare.txt --n-layer 1 --n-embd 64 --n-head 2 \
     --steps 2000 --out checkpoints/draft.pt            # small draft model
 
@@ -40,6 +45,7 @@ python scripts/benchmark.py              # KV cache vs no cache
 python scripts/bench_gqa.py              # cache memory: MHA vs GQA vs MQA
 python scripts/bench_batching.py         # continuous batching throughput
 python scripts/bench_speculative.py      # speculative decoding speedup
+python scripts/bench_bpe.py              # tokenizer training time and compression
 ```
 
 ## How each feature is verified
@@ -65,6 +71,14 @@ checks 2,500 speculative samples against it. A power check asserts the draft rea
 different distribution, and I confirmed the test fails when the algorithm is deliberately broken
 (always accepting proposals, or resampling from `p` instead of the residual `max(0, p - q)`).
 
+**BPE tokenizer.** Round-trips random unicode (accents, CJK, emoji, control characters,
+underscores) exactly. The incremental trainer is checked against a naive "recount every pair each
+iteration" reference and must learn identical merges; encoding is checked against a reference that
+applies merges in learned order; the classic `aaabdaaabac` example gives the textbook merges. A
+boundary test asserts merges never cross chunk boundaries. As with speculative decoding, I
+confirmed the tests fail when the code is deliberately broken (stale pair counts, wrong
+tie-break, wrong merge priority in the encoder).
+
 ## Results
 
 All numbers were measured with this repo's scripts on an Intel iMac (6 CPU threads, no GPU).
@@ -82,6 +96,31 @@ CPU timings are noisy; treat small differences as approximate.
 | 1200 | 1.348 | 1.596 |
 
 Initial loss 4.24 is close to ln 65 = 4.17 (uniform over the 65-character vocabulary), as expected.
+
+### BPE tokenizer vs characters
+
+Same architecture, batch size (24) and step count (1200); only the tokenizer differs. Loss per
+token is not comparable across tokenizers, so the comparison is **bits per byte** of held-out text:
+
+| tokenizer | vocab | bytes / token | params | val bits/byte | train time |
+|:--|--:|--:|--:|--:|--:|
+| character | 65 | 1.00 | 0.81M | 2.303 | 5.6 min |
+| byte-level BPE | 512 | 1.88 | 0.87M | **2.127** | 7.4 min |
+
+BPE needs about 8% fewer bits per byte. Read this with care: a BPE batch covers ~1.9x more text
+(the same 128-token context spans more characters), the model is slightly larger (bigger
+embedding table), and it trained ~30% longer, so this is not a compute-matched comparison. It also
+overfits sooner: validation loss rose between steps 1000 and 1200 (2.116 -> 2.127 bits/byte) while
+training loss kept falling, on only ~0.5M training tokens.
+
+Tokenizer cost and compression on held-out text (`scripts/bench_bpe.py`, pure Python):
+
+| vocab | train time (s) | bytes/token | encode (MB/s) | round-trip |
+|---:|---:|---:|---:|:-:|
+| 300 | 0.5 | 1.38 | 2.73 | yes |
+| 512 | 1.1 | 1.88 | 2.08 | yes |
+| 1024 | 2.7 | 2.26 | 1.94 | yes |
+| 2048 | 6.5 | 2.56 | 1.80 | yes |
 
 ### KV cache
 
@@ -155,6 +194,10 @@ GPU-scale target the same acceptance rates would give a larger speedup.
 * **Ties in parity tests (avoided).** The default init gives near-uniform logits, where greedy
   argmax could flip on float noise between code paths. Parity tests therefore use a wider init
   (`tests/helpers.py`) so they compare confident outputs rather than ties.
+* **A test that could not fail.** When I deliberately broke the BPE encoder (applying the
+  highest-rank merge first instead of the lowest), all 19 tests still passed: the random-string
+  comparison against the reference almost never hits two competing overlapping merges. I added a
+  deterministic test (`ab` vs `bc` competing for the same `b`) that does catch it.
 * **Wrong test, not wrong code.** One batching test failed because it sampled cache width *after*
   a row had already been retired in the same step; the engine was right, the assertion was not.
 
@@ -167,11 +210,14 @@ GPU-scale target the same acceptance rates would give a larger speedup.
 * The cache grows by `torch.cat` each step (simple and correct, but it reallocates); a production
   system would use preallocated or paged blocks.
 * Attention is the plain `O(T^2)`-memory formulation: no FlashAttention.
-* Character-level and small-scale: the point is correctness and clarity, not sample quality.
+* The BPE trainer and encoder are pure Python: fine for megabyte-scale corpora (seconds), not for
+  web-scale ones. Pre-tokenization is a simplified GPT-2-style regex, not the exact `tiktoken`
+  pattern, so token ids are not compatible with any public tokenizer.
+* Small scale (0.8M parameters, 1.1 MB of text): the point is correctness and clarity, not sample
+  quality.
 
 ## Roadmap
 
-- [ ] BPE tokenizer trained from scratch, with round-trip tests
 - [ ] Paged KV cache (fixed-size blocks, block table) to remove the `torch.cat` reallocation
 - [ ] Speculative decoding inside the batch engine
 - [ ] Load a public checkpoint into this architecture and match Hugging Face logits

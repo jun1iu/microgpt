@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+from microgpt.bpe import BPETokenizer
 from microgpt.data import CharTokenizer, get_batch
 from microgpt.model import GPT, GPTConfig
 
@@ -37,6 +38,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", required=True, help="path to a UTF-8 text file")
     p.add_argument("--out", default="checkpoints/model.pt")
+    p.add_argument("--tokenizer", choices=["char", "bpe"], default="char")
+    p.add_argument("--vocab-size", type=int, default=512, help="BPE vocabulary size (incl. bytes)")
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--block-size", type=int, default=128)
@@ -52,10 +55,18 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     text = Path(args.data).read_text(encoding="utf-8")
-    tok = CharTokenizer.from_text(text)
-    data = torch.tensor(tok.encode(text), dtype=torch.long)
-    split = int(0.9 * len(data))
-    train_data, val_data = data[:split], data[split:]
+    cut = int(0.9 * len(text))
+    train_text, val_text = text[:cut], text[cut:]
+    if args.tokenizer == "bpe":
+        tok = BPETokenizer.train(train_text, args.vocab_size)  # merges learned on train split only
+    else:
+        tok = CharTokenizer.from_text(text)
+    train_data = torch.tensor(tok.encode(train_text), dtype=torch.long)
+    val_data = torch.tensor(tok.encode(val_text), dtype=torch.long)
+    # Losses are nats per *token*, which is not comparable across tokenizers. Bits per byte of
+    # raw text is: it is how many bits the model needs per byte of the held-out text.
+    bits_per_byte = math.log2(math.e) * len(val_data) / len(val_text.encode("utf-8"))
+    print(f"tokenizer={args.tokenizer} bytes/token={len(val_text.encode()) / len(val_data):.2f}")
 
     cfg = GPTConfig(
         vocab_size=tok.vocab_size,
@@ -66,7 +77,7 @@ def main() -> None:
         n_kv_head=args.n_kv_head,
     )
     model = GPT(cfg)
-    print(f"vocab={tok.vocab_size} params={model.num_params():,} train_chars={len(train_data):,}")
+    print(f"vocab={tok.vocab_size} params={model.num_params():,} train_tokens={len(train_data):,}")
 
     decay = [p for p in model.parameters() if p.dim() >= 2]
     no_decay = [p for p in model.parameters() if p.dim() < 2]
@@ -83,7 +94,10 @@ def main() -> None:
         if step % args.eval_every == 0:
             tr = estimate_loss(model, train_data, args.batch_size)
             va = estimate_loss(model, val_data, args.batch_size)
-            print(f"step {step:5d} | train {tr:.3f} | val {va:.3f} | {time.time() - t0:6.1f}s")
+            print(
+                f"step {step:5d} | train {tr:.3f} | val {va:.3f} "
+                f"| val bits/byte {va * bits_per_byte:.3f} | {time.time() - t0:6.1f}s"
+            )
         if step == args.steps:
             break
         x, y = get_batch(train_data, args.batch_size, args.block_size)
@@ -95,7 +109,8 @@ def main() -> None:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"config": asdict(cfg), "model": model.state_dict(), "chars": tok.chars}, out)
+    ckpt = {"config": asdict(cfg), "model": model.state_dict(), "tokenizer": tok.to_dict()}
+    torch.save(ckpt, out)
     print(f"saved {out}")
 
 

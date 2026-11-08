@@ -7,7 +7,7 @@ import sys
 
 import torch
 
-from microgpt.data import CharTokenizer
+from microgpt.data import CharTokenizer, tokenizer_from_dict
 from microgpt.model import GPT, GPTConfig
 from microgpt.speculative import speculative_generate
 
@@ -17,7 +17,11 @@ def load_checkpoint(path: str):
     model = GPT(GPTConfig(**ckpt["config"]))
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model, CharTokenizer(ckpt["chars"])
+    if "tokenizer" in ckpt:
+        tok = tokenizer_from_dict(ckpt["tokenizer"])
+    else:  # checkpoints written before BPE support stored only the character list
+        tok = CharTokenizer(ckpt["chars"])
+    return model, tok
 
 
 def main() -> None:

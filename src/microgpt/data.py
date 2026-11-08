@@ -1,10 +1,12 @@
-"""Character-level tokenizer and batching."""
+"""Tokenizers and batching."""
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Union
 
 import torch
+
+from microgpt.bpe import BPETokenizer
 
 
 class CharTokenizer:
@@ -25,6 +27,21 @@ class CharTokenizer:
 
     def decode(self, ids: Sequence[int]) -> str:
         return "".join(self.chars[i] for i in ids)
+
+    def to_dict(self) -> dict:
+        return {"type": "char", "chars": self.chars}
+
+
+Tokenizer = Union[CharTokenizer, BPETokenizer]
+
+
+def tokenizer_from_dict(d: dict) -> Tokenizer:
+    kind = d.get("type")
+    if kind == "char":
+        return CharTokenizer(d["chars"])
+    if kind == "bpe":
+        return BPETokenizer.from_dict(d)
+    raise ValueError(f"unknown tokenizer type: {kind!r}")
 
 
 def get_batch(
