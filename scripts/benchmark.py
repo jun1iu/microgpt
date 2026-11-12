@@ -1,5 +1,7 @@
 """Measure decoding throughput with and without the KV cache.
 
+Usage:
+
     python scripts/benchmark.py            # prints a markdown table
 """
 

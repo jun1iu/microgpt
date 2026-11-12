@@ -1,5 +1,7 @@
 """KV-cache memory and decode speed for multi-head vs grouped-query vs multi-query attention.
 
+Usage:
+
     python scripts/bench_gqa.py
 """
 

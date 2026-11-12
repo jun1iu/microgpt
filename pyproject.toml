@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "microgpt"
 version = "0.1.0"
-description = "A from-scratch GPT in PyTorch: RoPE, RMSNorm, SwiGLU, KV-cache inference, and the tests that prove it is correct."
+description = "A from-scratch GPT in PyTorch with the inference techniques used in LLM serving: KV cache, grouped-query attention, continuous batching, speculative decoding and a byte-level BPE tokenizer, each tested against a reference."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["torch>=2.2", "numpy"]

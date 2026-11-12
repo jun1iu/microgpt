@@ -1,5 +1,7 @@
 """BPE tokenizer: training time, compression on held-out text, and encode throughput.
 
+Usage:
+
     python scripts/bench_bpe.py --data data/shakespeare.txt
 """
 

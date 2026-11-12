@@ -1,5 +1,7 @@
 """Throughput of the continuous-batching engine vs serving requests one at a time.
 
+Usage:
+
     python scripts/bench_batching.py
 """
 

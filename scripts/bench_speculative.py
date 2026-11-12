@@ -46,7 +46,9 @@ def main() -> None:
 
     base = run(
         lambda i: target.generate(
-            encode(i), args.tokens, temperature=args.temperature,
+            encode(i),
+            args.tokens,
+            temperature=args.temperature,
             generator=torch.Generator().manual_seed(i),
         )  # fmt: skip
     )

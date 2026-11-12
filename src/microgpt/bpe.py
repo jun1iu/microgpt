@@ -71,9 +71,7 @@ class BPETokenizer:
 
     # ------------------------------------------------------------------ training
     @classmethod
-    def train(
-        cls, text: str, vocab_size: int, special_tokens: Sequence[str] = ()
-    ) -> BPETokenizer:
+    def train(cls, text: str, vocab_size: int, special_tokens: Sequence[str] = ()) -> BPETokenizer:
         n_merges = vocab_size - 256 - len(special_tokens)
         if n_merges < 0:
             raise ValueError(

@@ -1,4 +1,5 @@
-"""microgpt: a from-scratch GPT with KV-cache inference."""
+"""microgpt: a from-scratch GPT with KV-cache inference, grouped-query attention,
+continuous batching, speculative decoding and a byte-level BPE tokenizer."""
 
 from microgpt.bpe import BPETokenizer
 from microgpt.data import CharTokenizer
